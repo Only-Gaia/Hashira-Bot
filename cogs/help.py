@@ -97,7 +97,7 @@ class Help(commands.Cog):
 
         total_commands = sum(len(v) for v in cog_map.values())
         e = discord.Embed(
-            title="📖 Menu di aiuto — Kira Bot",
+            title="📖 Menu di aiuto — Hashira Bot",
             description=(
                 f"Ho **{total_commands}** comandi disponibili, divisi in categorie.\n"
                 "Seleziona una categoria dal menu qui sotto per vederli, oppure usa `/help <categoria>`.\n\n"
