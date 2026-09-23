@@ -12,14 +12,19 @@ LINK_RE = __import__("re").compile(r"(https?://|discord\.gg/|www\.)\S+", __impor
 
 DANGEROUS_PERMS = ("administrator", "ban_members", "kick_members", "manage_guild", "manage_roles", "manage_channels")
 
+ANTISPAM_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 ore
+ANTISPAM_MAX_MESSAGES = 5
+ANTISPAM_WINDOW_SECONDS = 3
+
 
 class AutoMod(commands.Cog):
-    """Anti-link, anti-nuke, anti-raid e blacklist globale."""
+    """Anti-link, anti-nuke, anti-raid, anti-spam e blacklist globale."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._recent_actions: dict[int, list[float]] = {}  # user_id -> timestamps azioni pericolose
         self._recent_joins: dict[int, list[float]] = {}  # guild_id -> timestamps join
+        self._recent_messages: dict[int, list[float]] = {}  # user_id -> timestamps messaggi (antispam)
 
     # ---------------- CONFIG ----------------
     @commands.hybrid_command(name="antilink", description="Attiva/disattiva il blocco automatico dei link")
@@ -46,6 +51,14 @@ class AutoMod(commands.Cog):
         await update_guild_config(ctx.guild.id, antiraid=int(enabled))
         await ctx.reply(f"✅ Anti-raid {'attivato' if enabled else 'disattivato'}.")
 
+    @commands.hybrid_command(name="antispam", description="Attiva/disattiva la protezione anti-spam")
+    @app_commands.describe(stato="on per attivare, off per disattivare")
+    @commands.has_permissions(administrator=True)
+    async def antispam(self, ctx: commands.Context, stato: str):
+        enabled = stato.lower() in ("on", "attiva", "true", "si", "sì")
+        await update_guild_config(ctx.guild.id, antispam=int(enabled))
+        await ctx.reply(f"✅ Anti-spam {'attivato' if enabled else 'disattivato'} (limite: {ANTISPAM_MAX_MESSAGES} messaggi in {ANTISPAM_WINDOW_SECONDS}s).")
+
     # ---------------- ANTI-LINK ----------------
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -66,6 +79,33 @@ class AutoMod(commands.Cog):
                 await message.author.timeout(until, reason="Anti-link: invio di un link non autorizzato")
                 await message.channel.send(
                     f"🚫 {message.author.mention} è stato silenziato per 2 ore per aver inviato un link.",
+                    delete_after=10,
+                )
+            except discord.Forbidden:
+                pass
+
+    # ---------------- ANTI-SPAM (troppi messaggi in poco tempo) ----------------
+    @commands.Cog.listener(name="on_message")
+    async def on_message_antispam(self, message: discord.Message):
+        if message.author.bot or not message.guild:
+            return
+        if message.author.guild_permissions.manage_messages:
+            return
+        cfg = await get_guild_config(message.guild.id)
+        if not cfg.get("antispam"):
+            return
+        now_t = time.time()
+        timestamps = self._recent_messages.setdefault(message.author.id, [])
+        timestamps.append(now_t)
+        timestamps = [t for t in timestamps if now_t - t < ANTISPAM_WINDOW_SECONDS]
+        self._recent_messages[message.author.id] = timestamps
+        if len(timestamps) > ANTISPAM_MAX_MESSAGES:
+            self._recent_messages[message.author.id] = []  # reset per evitare timeout ripetuti
+            try:
+                until = discord.utils.utcnow() + datetime.timedelta(seconds=ANTISPAM_TIMEOUT_SECONDS)
+                await message.author.timeout(until, reason="Anti-spam: troppi messaggi in poco tempo")
+                await message.channel.send(
+                    f"🚫 {message.author.mention} è stato silenziato per 2 ore per spam.",
                     delete_after=10,
                 )
             except discord.Forbidden:
