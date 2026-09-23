@@ -110,7 +110,18 @@ async def init_db():
             mute_role INTEGER,
             member_role INTEGER,
             desk_text TEXT,
-            trial_questions TEXT
+            trial_questions TEXT,
+            general_chat_channel INTEGER,
+            staff_chat_channel INTEGER
+        );
+
+        -- ATTIVITÀ CHAT (per il tracking delle quest "mantieni attiva la chat")
+        CREATE TABLE IF NOT EXISTS chat_activity (
+            guild_id INTEGER NOT NULL,
+            channel_type TEXT NOT NULL,
+            streak_start INTEGER NOT NULL,
+            last_message INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, channel_type)
         );
 
         -- GIVEAWAY
@@ -150,7 +161,8 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER NOT NULL,
             name TEXT NOT NULL,
-            message TEXT NOT NULL
+            message TEXT NOT NULL,
+            author_id INTEGER
         );
 
         -- MATRIMONI
@@ -174,6 +186,11 @@ async def _migrate_missing_columns(db: aiosqlite.Connection):
     migrations = {
         "guild_config": {
             "antispam": "INTEGER NOT NULL DEFAULT 0",
+            "general_chat_channel": "INTEGER",
+            "staff_chat_channel": "INTEGER",
+        },
+        "partnerships": {
+            "author_id": "INTEGER",
         },
     }
 
