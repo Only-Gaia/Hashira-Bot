@@ -4,20 +4,25 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from database import get_db, get_guild_config, update_guild_config, dumps, loads
+from database import get_db, get_guild_config, update_guild_config, dumps, loads, now
 from config import EMBED_COLOR
 
 MAX_STAFF_ROLES = 15
 
-# I tipi "messages" e "invites" sono verificati automaticamente dal bot confrontando
-# le statistiche reali dell'utente con quelle registrate al momento dell'assegnazione.
-# I tipi "collab" e "chat" non sono tracciabili automaticamente e vengono considerati
-# validi quando l'utente li segna (nessuna metrica interna li misura).
+# Se passano più di questi secondi senza un nuovo messaggio nella chat monitorata,
+# lo streak di attività si considera interrotto e riparte dal prossimo messaggio.
+CHAT_GAP_THRESHOLD = 120  # 2 minuti
+
+# Tutte le quest tracciabili usano mode="diff" (contatore crescente: confronta il valore
+# attuale con quello al momento dell'assegnazione, tramite "baseline") oppure mode="streak"
+# (valore assoluto, per l'attività chat continua). Nessuna quest viene più validata "sulla
+# fiducia": ogni tipo ha una metrica reale collegata a un comando o dato del bot.
 QUEST_POOL = [
-    {"key": "collab", "desc": "Fai {n} collab", "n": (3, 5), "trackable": False},
-    {"key": "invites", "desc": "Porta {n} nuovi inviti", "n": (3, 5), "trackable": True},
-    {"key": "chat", "desc": "Mantieni attiva la chat dello staff", "n": (1, 1), "trackable": False},
-    {"key": "messages", "desc": "Invia {n} messaggi nel server", "n": (20, 40), "trackable": True},
+    {"key": "collab", "desc": "Fai {n} partnership", "n": (2, 4), "trackable": True, "mode": "diff"},
+    {"key": "invites", "desc": "Porta {n} nuovi inviti", "n": (3, 5), "trackable": True, "mode": "diff"},
+    {"key": "messages", "desc": "Invia {n} messaggi nel server", "n": (20, 40), "trackable": True, "mode": "diff"},
+    {"key": "chat_general", "desc": "Mantieni attiva la chat generale per {n} minuti consecutivi", "n": (15, 30), "trackable": True, "mode": "streak"},
+    {"key": "chat_staff", "desc": "Mantieni attiva la chat staff per {n} minuti consecutivi", "n": (15, 30), "trackable": True, "mode": "streak"},
 ]
 POINTS_PER_QUEST = 5
 
@@ -35,16 +40,37 @@ async def is_staff(member: discord.Member) -> bool:
 
 
 async def _current_stat(guild_id: int, user_id: int, key: str) -> int:
-    """Legge la statistica reale attuale dell'utente per una quest tracciabile."""
+    """Legge la statistica reale attuale per una quest tracciabile."""
     db = await get_db()
     if key == "messages":
         cur = await db.execute("SELECT messages FROM levels WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+        row = await cur.fetchone()
+        return row[0] if row else 0
     elif key == "invites":
         cur = await db.execute("SELECT count FROM invites WHERE guild_id=? AND user_id=?", (guild_id, user_id))
-    else:
-        return 0
-    row = await cur.fetchone()
-    return row[0] if row else 0
+        row = await cur.fetchone()
+        return row[0] if row else 0
+    elif key == "collab":
+        # conta quante partnership l'utente ha creato con /partnershipadd in questo server
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM partnerships WHERE guild_id=? AND author_id=?",
+            (guild_id, user_id),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+    elif key in ("chat_general", "chat_staff"):
+        cur = await db.execute(
+            "SELECT streak_start, last_message FROM chat_activity WHERE guild_id=? AND channel_type=?",
+            (guild_id, key),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return 0
+        streak_start, last_message = row
+        if now() - last_message > CHAT_GAP_THRESHOLD:
+            return 0
+        return (last_message - streak_start) // 60
+    return 0
 
 
 class Staff(commands.Cog):
@@ -52,6 +78,56 @@ class Staff(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    # ---------------- MONITORAGGIO ATTIVITÀ CHAT (per le quest chat_general/chat_staff) ----------------
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild:
+            return
+
+        cfg = await get_guild_config(message.guild.id)
+        channel_type = None
+        if cfg.get("general_chat_channel") == message.channel.id:
+            channel_type = "chat_general"
+        elif cfg.get("staff_chat_channel") == message.channel.id:
+            channel_type = "chat_staff"
+        if not channel_type:
+            return
+
+        db = await get_db()
+        cur = await db.execute(
+            "SELECT streak_start, last_message FROM chat_activity WHERE guild_id=? AND channel_type=?",
+            (message.guild.id, channel_type),
+        )
+        row = await cur.fetchone()
+        ts = now()
+
+        if row and (ts - row[1]) <= CHAT_GAP_THRESHOLD:
+            streak_start = row[0]
+        else:
+            streak_start = ts
+
+        await db.execute(
+            """INSERT INTO chat_activity (guild_id, channel_type, streak_start, last_message) VALUES (?,?,?,?)
+               ON CONFLICT(guild_id, channel_type) DO UPDATE SET streak_start=excluded.streak_start, last_message=excluded.last_message""",
+            (message.guild.id, channel_type, streak_start, ts),
+        )
+        await db.commit()
+
+    # ---------------- CONFIG CANALI CHAT MONITORATI ----------------
+    @commands.hybrid_command(name="chatconfig", description="Imposta il canale della chat generale da monitorare per le quest")
+    @app_commands.describe(channel="Canale della chat generale")
+    @commands.has_permissions(manage_guild=True)
+    async def chatconfig(self, ctx: commands.Context, channel: discord.TextChannel):
+        await update_guild_config(ctx.guild.id, general_chat_channel=channel.id)
+        await ctx.reply(f"✅ Chat generale impostata su {channel.mention}. Verrà monitorata per le quest \"chat generale\".")
+
+    @commands.hybrid_command(name="chatsconfig", description="Imposta il canale della chat staff da monitorare per le quest")
+    @app_commands.describe(channel="Canale della chat staff")
+    @commands.has_permissions(manage_guild=True)
+    async def chatsconfig(self, ctx: commands.Context, channel: discord.TextChannel):
+        await update_guild_config(ctx.guild.id, staff_chat_channel=channel.id)
+        await ctx.reply(f"✅ Chat staff impostata su {channel.mention}. Verrà monitorata per le quest \"chat staff\".")
 
     # ---------------- CONFIG RUOLI STAFF ----------------
     @commands.hybrid_command(name="staff", description="Aggiunge un ruolo alla lista dei ruoli staff abilitati (max 15)")
@@ -102,8 +178,14 @@ class Staff(commands.Cog):
         assigned = []
         for q in quests:
             n = random.randint(*q["n"])
-            quest = {"key": q["key"], "desc": q["desc"].format(n=n), "target": n, "trackable": q["trackable"]}
-            if q["trackable"]:
+            quest = {
+                "key": q["key"],
+                "desc": q["desc"].format(n=n),
+                "target": n,
+                "trackable": q["trackable"],
+                "mode": q.get("mode"),
+            }
+            if q["trackable"] and q.get("mode") == "diff":
                 quest["baseline"] = await _current_stat(guild_id, user_id, q["key"])
             assigned.append(quest)
         progress = [0 for _ in assigned]
@@ -141,9 +223,11 @@ class Staff(commands.Cog):
                 continue  # già verificata in precedenza
             if q.get("trackable"):
                 current = await _current_stat(ctx.guild.id, ctx.author.id, q["key"])
-                done = (current - q.get("baseline", 0)) >= q["target"]
+                if q.get("mode") == "streak":
+                    done = current >= q["target"]
+                else:  # mode == "diff"
+                    done = (current - q.get("baseline", 0)) >= q["target"]
             else:
-                # non tracciabile automaticamente: la consideriamo valida quando l'utente la segna
                 done = True
             if done:
                 progress[i] = 1
@@ -194,7 +278,7 @@ class Staff(commands.Cog):
         await update_guild_config(ctx.guild.id, desk_text=None)
         await ctx.reply("✅ Desk rimosso.")
 
-    # ---------------- TRIAL (domande provino) ----------------
+    # ---------------- TRIAL ----------------
     @commands.hybrid_command(name="trial", description="Mostra le domande del provino configurate (messaggio di testo)")
     async def trial(self, ctx: commands.Context):
         cfg = await get_guild_config(ctx.guild.id)
@@ -221,14 +305,12 @@ class Staff(commands.Cog):
         await ctx.reply("✅ Domande provino rimosse.")
 
     # ---------------- PARTNERSHIP ----------------
-    @commands.hybrid_command(name="partnershipadd", description="Salva un template di partnership")
-    @app_commands.describe(name="Nome identificativo", message="Testo della partnership")
+    @commands.hybrid_command(name="partnershipadd", description="Apre un modulo per creare e pubblicare una nuova partnership")
     @commands.has_permissions(manage_guild=True)
-    async def partnership_add(self, ctx: commands.Context, name: str, *, message: str):
-        db = await get_db()
-        await db.execute("INSERT INTO partnerships (guild_id, name, message) VALUES (?,?,?)", (ctx.guild.id, name, message))
-        await db.commit()
-        await ctx.reply(f"✅ Partnership **{name}** salvata.")
+    async def partnership_add(self, ctx: commands.Context):
+        if not ctx.interaction:
+            return await ctx.reply("❌ Questo comando apre un modulo, quindi funziona solo come slash command: usa `/partnershipadd`.")
+        await ctx.interaction.response.send_modal(PartnershipModal())
 
     @commands.hybrid_command(name="partnership", description="Invia una partnership salvata (messaggio di testo)")
     @app_commands.describe(name="Nome della partnership da inviare")
@@ -238,7 +320,7 @@ class Staff(commands.Cog):
         row = await cur.fetchone()
         if not row:
             return await ctx.reply(f"❌ Nessuna partnership trovata con il nome **{name}**.")
-        await ctx.channel.send(row[0])
+        await ctx.channel.send(row[0], allowed_mentions=discord.AllowedMentions.none())
         if ctx.interaction:
             await ctx.reply("✅ Inviata.", ephemeral=True)
 
@@ -259,6 +341,56 @@ class Staff(commands.Cog):
         if not rows:
             return await ctx.reply("Nessuna partnership salvata.")
         await ctx.reply("📋 Partnership salvate: " + ", ".join(f"`{r[0]}`" for r in rows))
+
+
+class PartnershipModal(discord.ui.Modal, title="Nuova partnership"):
+    description = discord.ui.TextInput(
+        label="Descrizione della partnership",
+        style=discord.TextStyle.paragraph,
+        placeholder="Incolla qui il testo della partnership. I ping verranno rimossi automaticamente.",
+        max_length=2000,
+        required=True,
+    )
+    server_name = discord.ui.TextInput(
+        label="Nome del server partner",
+        style=discord.TextStyle.short,
+        max_length=100,
+        required=True,
+    )
+    server_members = discord.ui.TextInput(
+        label="Membri del server partner",
+        style=discord.TextStyle.short,
+        placeholder="es: 1500",
+        max_length=10,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        import re
+        clean_desc = re.sub(r"<@[!&]?\d+>|@everyone|@here", "", str(self.description.value)).strip()
+
+        text = (
+            f"🤝 **PARTNERSHIP**\n\n"
+            f"{clean_desc}\n\n"
+            f"**Server:** {self.server_name.value}\n"
+            f"**Membri:** {self.server_members.value}"
+        )
+
+        db = await get_db()
+        await db.execute(
+            "INSERT INTO partnerships (guild_id, name, message, author_id) VALUES (?,?,?,?)",
+            (interaction.guild.id, str(self.server_name.value), text, interaction.user.id),
+        )
+        await db.commit()
+
+        await interaction.channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.response.send_message("✅ Partnership pubblicata.", ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ Si è verificato un errore durante l'invio.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Si è verificato un errore durante l'invio.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
