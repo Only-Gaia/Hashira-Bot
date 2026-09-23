@@ -72,9 +72,21 @@ class Help(commands.Cog):
     def build_cog_map(self) -> dict[str, list[commands.Command]]:
         cog_map: dict[str, list[commands.Command]] = {}
         for cog_name, cog in self.bot.cogs.items():
-            cmds = [c for c in cog.get_commands() if not c.hidden]
+            cmds: list[commands.Command] = []
+            for c in cog.get_commands():
+                if c.hidden:
+                    continue
+                if isinstance(c, commands.Group):
+                    # gruppo hybrid (es. "giveaway", "logs"): includi il gruppo stesso
+                    # (utile se ha un fallback/comportamento proprio, es. ".logs")
+                    # e tutti i suoi sottocomandi, ricorsivamente
+                    cmds.extend(sub for sub in c.walk_commands() if not sub.hidden)
+                    if c.invoke_without_command or getattr(c, "fallback", None):
+                        cmds.append(c)
+                else:
+                    cmds.append(c)
             if cmds:
-                cog_map[cog_name] = sorted(cmds, key=lambda c: c.name)
+                cog_map[cog_name] = sorted(cmds, key=lambda c: c.qualified_name)
         return cog_map
 
     @commands.hybrid_command(name="help", description="Mostra tutti i comandi del bot organizzati per categoria")
