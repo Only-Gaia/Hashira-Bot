@@ -12,9 +12,13 @@ logging.basicConfig(level=logging.INFO)
 intents = discord.Intents.all()
 
 
-class KiraBot(commands.Bot):
+class HashiraBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix=commands.when_mentioned_or(*PREFIXES), intents=intents)
+        super().__init__(
+            command_prefix=commands.when_mentioned_or(*PREFIXES),
+            intents=intents,
+            help_command=None,  # disabilitiamo quello di default, lo sostituisce cogs.help
+        )
 
     async def setup_hook(self):
         await init_db()
@@ -30,6 +34,7 @@ class KiraBot(commands.Bot):
             "cogs.economy",
             "cogs.fun",
             "cogs.staff",
+            "cogs.help",
         ):
             await self.load_extension(ext)
             logging.info(f"Caricato: {ext}")
@@ -42,7 +47,7 @@ class KiraBot(commands.Bot):
 
 
 async def main():
-    bot = KiraBot()
+    bot = HashiraBot()
     async with bot:
         await bot.start(TOKEN)
 
