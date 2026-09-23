@@ -6,6 +6,7 @@ Tutte le tabelle usate dal bot vengono create qui al primo avvio.
 import aiosqlite
 import json
 import time
+import logging
 from config import DB_PATH
 
 _db: aiosqlite.Connection | None = None
@@ -105,6 +106,7 @@ async def init_db():
             antinuke INTEGER NOT NULL DEFAULT 0,
             antiraid INTEGER NOT NULL DEFAULT 0,
             antilink INTEGER NOT NULL DEFAULT 0,
+            antispam INTEGER NOT NULL DEFAULT 0,
             mute_role INTEGER,
             member_role INTEGER,
             desk_text TEXT,
@@ -159,6 +161,31 @@ async def init_db():
         );
         """
     )
+    await db.commit()
+    await _migrate_missing_columns(db)
+
+
+async def _migrate_missing_columns(db: aiosqlite.Connection):
+    """
+    Aggiunge colonne mancanti alle tabelle esistenti senza cancellare i dati.
+    Utile quando lo schema viene esteso dopo che il database è già stato creato.
+    Aggiungi qui ogni nuova colonna introdotta in futuro.
+    """
+    migrations = {
+        "guild_config": {
+            "antispam": "INTEGER NOT NULL DEFAULT 0",
+        },
+    }
+
+    for table, columns in migrations.items():
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        existing_columns = {row[1] for row in await cursor.fetchall()}
+
+        for col_name, col_def in columns.items():
+            if col_name not in existing_columns:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+                logging.info(f"Migrazione: aggiunta colonna '{col_name}' a '{table}'")
+
     await db.commit()
 
 
